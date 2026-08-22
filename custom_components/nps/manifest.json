@@ -1,0 +1,1 @@
+{"domain": "nps", "name": "NPS 隧道管理", "codeowners": ["@xiaoshi930"], "config_flow": true, "documentation": "https://github.com/xiaoshi930/ha-nps", "iot_class": "cloud_polling", "version": "0.1.0", "requirements": ["requests"]}
