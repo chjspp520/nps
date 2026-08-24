@@ -439,7 +439,3 @@ action:
 | 0.1.0 | 2026-08-22 | 初版：隧道/客户端开关 + 16 个 sensor |
 
 ---
-
-> 文档版本：1.0  
-> 维护者：@xiaoshi930  
-> 配套代码：`y:\custom_components\nps\`
