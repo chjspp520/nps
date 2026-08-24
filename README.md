@@ -2,7 +2,6 @@
 
 > 适用版本：`0.1.0`  
 > 适用 Home Assistant：支持 Config Flow 的版本  
-> 仓库路径：`y:\custom_components\nps\`  
 > 依赖：`requests`（唯一第三方依赖）
 
 ---
