@@ -8,9 +8,8 @@ import requests
 from homeassistant import config_entries
 from homeassistant.core import callback
 from homeassistant.data_entry_flow import FlowResult
-from homeassistant.helpers import config_validation as cv
 
-from .const import DOMAIN
+from .const import CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL, DOMAIN
 from .api import NpsApiClient
 
 _LOGGER = logging.getLogger(__name__)
@@ -96,19 +95,30 @@ class NpsConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     def async_get_options_flow(
         config_entry: config_entries.ConfigEntry,
     ) -> config_entries.OptionsFlow:
-        """返回选项配置流（暂不支持修改配置）."""
-        return NpsOptionsFlowHandler(config_entry)
+        """返回选项配置流."""
+        return NpsOptionsFlowHandler()
 
 
-class NpsOptionsFlowHandler(config_entries.OptionsFlow):
-    """NPS 配置选项流（预留接口）."""
-
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        """初始化选项流."""
-        self.config_entry = config_entry
+class NpsOptionsFlowHandler(config_entries.OptionsFlowWithReload):
+    """NPS 选项流：修改后自动重载配置入口."""
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
     ) -> FlowResult:
-        """管理选项步骤."""
-        return self.async_abort(reason="not_supported")
+        """管理选项步骤（轮询间隔）."""
+        if user_input is not None:
+            return self.async_create_entry(title="", data=user_input)
+
+        current = self.config_entry.options.get(
+            CONF_SCAN_INTERVAL, DEFAULT_SCAN_INTERVAL
+        )
+        return self.async_show_form(
+            step_id="init",
+            data_schema=vol.Schema(
+                {
+                    vol.Required(CONF_SCAN_INTERVAL, default=current): vol.All(
+                        vol.Coerce(int), vol.Range(min=5, max=3600)
+                    ),
+                }
+            ),
+        )

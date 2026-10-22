@@ -26,18 +26,20 @@ class NpsDataUpdateCoordinator(DataUpdateCoordinator):
         self,
         hass: HomeAssistant,
         api_client: NpsApiClient,
+        update_interval: timedelta = UPDATE_INTERVAL,
     ) -> None:
         """初始化协调器.
 
         Args:
             hass: Home Assistant 实例
             api_client: NPS API 客户端实例
+            update_interval: 轮询间隔（默认 30 秒，可由选项流覆盖）
         """
         super().__init__(
             hass,
             _LOGGER,
             name=DOMAIN,
-            update_interval=UPDATE_INTERVAL,
+            update_interval=update_interval,
         )
         self.api = api_client
         # 仪表盘数据（传感器用）

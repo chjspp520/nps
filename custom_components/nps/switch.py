@@ -10,6 +10,12 @@ from homeassistant.exceptions import HomeAssistantError
 from .const import DOMAIN
 from .coordinator import NpsDataUpdateCoordinator
 from .api import NpsApiClient
+from .helpers import (
+    build_device_info,
+    get_console_url,
+    panel_access_enabled,
+    set_panel_access,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -104,12 +110,7 @@ class NpsTunnelSwitch(SwitchEntity):
 
         self._attr_unique_id = f"{entry_id}_nps_tunnel_{tunnel_id}"
         self._attr_name = final_name
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, f"{entry_id}_nps_server")},
-            name=f"NPS Server ({host})",
-            manufacturer="NPS",
-            model="Tunnel Server",
-        )
+        self._host = host
 
         self._tunnel_id = tunnel_id
         self._attr_is_on = bool(tunnel_info.get("RunStatus", False))
@@ -180,6 +181,11 @@ class NpsTunnelSwitch(SwitchEntity):
     def icon(self) -> str:
         """根据开关状态返回不同图标."""
         return "mdi:lan-connect" if self._attr_is_on else "mdi:lan-disconnect"
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """设备信息（configuration_url 指向 NPS 管理面板）."""
+        return build_device_info(self.hass, self.entry_id, self._host)
 
     @callback
     def _handle_coordinator_update(self) -> None:
@@ -277,12 +283,7 @@ class NpsClientSwitch(SwitchEntity):
 
         self._attr_unique_id = f"{entry_id}_nps_client_{client_id}"
         self._attr_name = final_name
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, f"{entry_id}_nps_server")},
-            name=f"NPS Server ({host})",
-            manufacturer="NPS",
-            model="Tunnel Server",
-        )
+        self._host = host
         # 客户端图标通过动态 property 返回（根据在线状态切换）
 
         self._client_id = client_id
@@ -368,6 +369,11 @@ class NpsClientSwitch(SwitchEntity):
         """根据开关状态返回不同图标."""
         return "mdi:ethernet" if self._attr_is_on else "mdi:ethernet-off"
 
+    @property
+    def device_info(self) -> DeviceInfo:
+        """设备信息（configuration_url 指向 NPS 管理面板）."""
+        return build_device_info(self.hass, self.entry_id, self._host)
+
     @callback
     def _handle_coordinator_update(self) -> None:
         clients = getattr(self.coordinator, "clients_data", [])
@@ -432,6 +438,77 @@ class NpsClientSwitch(SwitchEntity):
         await self.coordinator.async_request_refresh()
 
 
+class NpsPanelAccessSwitch(SwitchEntity):
+    """控制 NPS 管理面板是否允许访问的开关.
+
+    关闭后：
+    - 设备页的「访问」链接会被移除（configuration_url 清空）
+    - 已打开的面板页面所有请求都会被拒绝
+    状态持久化在配置条目的 options 里，重启后保持。
+    """
+
+    _attr_should_poll = False
+
+    def __init__(
+        self,
+        coordinator: NpsDataUpdateCoordinator,
+        entry_id: str,
+        host: str,
+    ) -> None:
+        self.coordinator = coordinator
+        self.entry_id = entry_id
+        self._host = host
+        self._attr_unique_id = f"{entry_id}_nps_panel_access"
+        self._attr_name = "管理面板访问"
+        self._attr_is_on = True
+
+    @property
+    def suggested_object_id(self) -> str | None:
+        """固定 entity_id，避免中文名称被 slugify 成空."""
+        return "panel_access"
+
+    @property
+    def device_info(self) -> DeviceInfo:
+        """设备信息（configuration_url 指向 NPS 管理面板）."""
+        return build_device_info(self.hass, self.entry_id, self._host)
+
+    @property
+    def icon(self) -> str:
+        """禁用时显示带斜杠的锁."""
+        return "mdi:shield-lock" if self._attr_is_on else "mdi:shield-off-outline"
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        attributes = {"entry_id": self.entry_id}
+        if self._attr_is_on:
+            attributes["panel_url"] = get_console_url(self.hass, self.entry_id)
+        return attributes
+
+    async def async_added_to_hass(self) -> None:
+        """加入后同步一次真实状态（平台会在之后写入状态）."""
+        self._sync_from_entry()
+
+    @callback
+    def _handle_coordinator_update(self) -> None:
+        self._sync_from_entry()
+        self.async_write_ha_state()
+
+    def _sync_from_entry(self) -> None:
+        self._attr_is_on = panel_access_enabled(self.hass, self.entry_id)
+
+    async def async_turn_on(self, **kwargs) -> None:
+        _LOGGER.info("启用 NPS 管理面板访问")
+        set_panel_access(self.hass, self.entry_id, True)
+        self._sync_from_entry()
+        self.async_write_ha_state()
+
+    async def async_turn_off(self, **kwargs) -> None:
+        _LOGGER.warning("禁用 NPS 管理面板访问")
+        set_panel_access(self.hass, self.entry_id, False)
+        self._sync_from_entry()
+        self.async_write_ha_state()
+
+
 async def async_setup_entry(hass, config_entry, async_add_entities):
     """为所有隧道和客户端创建 SwitchEntity.
 
@@ -460,7 +537,10 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
                 continue
             entities.append(NpsClientSwitch(coordinator, api_client, entry_id, host, c))
 
-    _LOGGER.info("共创建 %d 个开关实体 (%d 隧道 + %d 客户端)",
+    # --- 管理面板访问开关 ---
+    entities.append(NpsPanelAccessSwitch(coordinator, entry_id, host))
+
+    _LOGGER.info("共创建 %d 个开关实体 (%d 隧道 + %d 客户端 + 1 面板访问)",
                  len(entities),
                  len([e for e in entities if isinstance(e, NpsTunnelSwitch)]),
                  len([e for e in entities if isinstance(e, NpsClientSwitch)]))

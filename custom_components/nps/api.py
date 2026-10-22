@@ -23,6 +23,40 @@ TUNNEL_TYPES = [
 # 请求超时设置（秒）
 REQUEST_TIMEOUT = 15
 
+# 各接口的候选路径：不同 NPS 版本/分支的尾部斜杠不一致，
+# 按顺序尝试，遇到 404/405 或非登录重定向就换下一个。
+ROUTES = {
+    "tunnel_list": ("/index/gettunnel", "/index/gettunnel/"),
+    "tunnel_get": ("/index/getonetunnel/", "/index/getonetunnel"),
+    "tunnel_add": ("/index/add/", "/index/add"),
+    "tunnel_edit": ("/index/edit/", "/index/edit"),
+    "tunnel_del": ("/index/del/", "/index/del"),
+    "tunnel_copy": ("/index/copy/", "/index/copy"),
+    "tunnel_start": ("/index/start", "/index/start/"),
+    "tunnel_stop": ("/index/stop", "/index/stop/"),
+    "host_list": ("/index/hostlist/", "/index/hostlist"),
+    "host_add": ("/index/addhost/", "/index/addhost"),
+    "host_edit": ("/index/edithost/", "/index/edithost"),
+    "host_del": ("/index/delhost/", "/index/delhost"),
+    "host_start": ("/index/hoststart/", "/index/hoststart"),
+    "host_stop": ("/index/hoststop/", "/index/hoststop"),
+    "client_list": ("/client/list", "/client/list/"),
+    "client_add": ("/client/add/", "/client/add"),
+    "client_edit": ("/client/edit/", "/client/edit"),
+    "client_del": ("/client/del/", "/client/del"),
+    "client_status": (
+        "/client/change_status",
+        "/client/changestatus/",
+        "/client/change_status/",
+        "/client/changestatus",
+    ),
+    "server_time": ("/auth/get_time", "/auth/get_time/"),
+}
+
+
+class _RouteMismatch(Exception):
+    """内部使用：该路径形式不存在（用于切换到候选路径）."""
+
 
 class NpsApiClient:
     """NPS 官方 API 客户端.
@@ -58,8 +92,36 @@ class NpsApiClient:
             "timestamp": timestamp,
         }
 
-    def _post(self, endpoint: str, **extra_params) -> dict:
-        """发送 POST 请求到 NPS API.
+    def _post(
+        self,
+        endpoints: str | tuple[str, ...] | list[str],
+        **extra_params,
+    ) -> dict:
+        """按候选路径顺序请求 API，返回第一个成功的 JSON 结果.
+
+        Args:
+            endpoints: 单个路径或候选路径列表（兼容尾部斜杠差异）
+            **extra_params: 额外的 POST 参数
+
+        Returns:
+            API 返回的 JSON 数据
+        """
+        candidates = (
+            (endpoints,) if isinstance(endpoints, str) else tuple(endpoints)
+        )
+        last_error: Exception | None = None
+        for endpoint in candidates:
+            try:
+                return self._post_once(endpoint, **extra_params)
+            except _RouteMismatch as err:
+                last_error = err
+                continue
+        raise ConnectionError(
+            f"未找到可用的 NPS 接口（已尝试 {list(candidates)}）: {last_error}"
+        )
+
+    def _post_once(self, endpoint: str, **extra_params) -> dict:
+        """向单个路径发送 POST 请求.
 
         Args:
             endpoint: API 路径（如 /index/gettunnel）
@@ -71,6 +133,7 @@ class NpsApiClient:
         Raises:
             HomeAssistantError: API 返回业务错误时
             ConnectionError: 网络连接失败时
+            _RouteMismatch: 该路径不存在时（内部使用）
         """
         url = f"{self._base_url}{endpoint}"
         payload = {**self._get_auth_params(), **extra_params}
@@ -92,19 +155,27 @@ class NpsApiClient:
             _LOGGER.error("NPS API 请求失败 [%s]: %s", endpoint, err)
             raise ConnectionError(f"无法连接 NPS 服务器: {err}") from err
 
-        # 检测 302 重定向 = 鉴权签名验证失败
-        if response.status_code == 302:
+        # 重定向：到登录页 = 鉴权失败；其他 = 路由形式不匹配（如缺/多尾部斜杠）
+        if response.status_code in (301, 302, 303, 307, 308):
             location = response.headers.get("Location", "")
-            _LOGGER.error(
-                "NPS 返回 302 重定向 [%s] → %s，说明 auth_key 鉴权签名不正确",
-                endpoint,
-                location,
+            if "login" in location.lower():
+                _LOGGER.error(
+                    "NPS 返回重定向 [%s] → %s，说明 auth_key 鉴权签名不正确",
+                    endpoint,
+                    location,
+                )
+                raise HomeAssistantError(
+                    "NPS API 鉴权失败（auth_key 不正确）。"
+                    "请确认填入的是 nps.conf 中 auth_key 的原始值，"
+                    "而非 Web 登录密码。"
+                )
+            raise _RouteMismatch(
+                f"{endpoint} → HTTP {response.status_code} {location}"
             )
-            raise HomeAssistantError(
-                "NPS API 鉴权失败（auth_key 不正确）。"
-                "请确认填入的是 nps.conf 中 auth_key 的原始值，"
-                "而非 Web 登录密码。"
-            )
+
+        # 路径不存在：交给候选路径重试
+        if response.status_code in (404, 405):
+            raise _RouteMismatch(f"{endpoint} → HTTP {response.status_code}")
 
         response.raise_for_status()
 
@@ -150,7 +221,7 @@ class NpsApiClient:
         for tunnel_type in TUNNEL_TYPES:
             try:
                 data = self._post(
-                    "/index/gettunnel",
+                    ROUTES["tunnel_list"],
                     offset=offset,
                     limit=limit,
                     type=tunnel_type,
@@ -184,7 +255,7 @@ class NpsApiClient:
             Remark, IsConnect(在线), Version, NowConn(连接数), Flow 等
         """
         data = self._post(
-            "/client/list",
+            ROUTES["client_list"],
             offset=offset,
             limit=limit,
         )
@@ -203,7 +274,7 @@ class NpsApiClient:
             Remark, Client.Id, Status, Location 等
         """
         data = self._post(
-            "/index/hostlist/",
+            ROUTES["host_list"],
             offset=offset,
             limit=limit,
         )
@@ -219,7 +290,7 @@ class NpsApiClient:
         Returns:
             {"time": unix_timestamp}
         """
-        return self._post("/auth/get_time")
+        return self._post(ROUTES["server_time"])
 
     def change_client_status(self, client_id: int, enable: bool) -> dict:
         """开启或关闭客户端连接.
@@ -236,7 +307,9 @@ class NpsApiClient:
         """
         action = "启用" if enable else "禁用"
         _LOGGER.info("正在%s客户端 [ID=%d]", action, client_id)
-        result = self._post("/client/change_status", id=client_id, status=str(enable).lower())
+        result = self._post(
+            ROUTES["client_status"], id=client_id, status=str(enable).lower()
+        )
         _LOGGER.info("客户端 [ID=%d] 已%s", client_id, action)
         return result
 
@@ -250,7 +323,7 @@ class NpsApiClient:
             API 返回结果 {"status": 1, "msg": "ok"}
         """
         _LOGGER.info("正在开启隧道 [ID=%d]", tunnel_id)
-        return self._post("/index/start", id=tunnel_id)
+        return self._post(ROUTES["tunnel_start"], id=tunnel_id)
 
     def stop_tunnel(self, tunnel_id: int) -> dict:
         """停止指定隧道.
@@ -262,7 +335,87 @@ class NpsApiClient:
             API 返回结果 {"status": 1, "msg": "ok"}
         """
         _LOGGER.info("正在停止隧道 [ID=%d]", tunnel_id)
-        return self._post("/index/stop", id=tunnel_id)
+        return self._post(ROUTES["tunnel_stop"], id=tunnel_id)
+
+    # ------------------------------------------------------------------
+    # 隧道的增删改查（管理面板使用）
+    # ------------------------------------------------------------------
+
+    def get_tunnel(self, tunnel_id: int) -> dict:
+        """获取单条隧道详情（返回 data 字段）."""
+        data = self._post(ROUTES["tunnel_get"], id=tunnel_id)
+        return data.get("data") or {}
+
+    def add_tunnel(self, **params) -> dict:
+        """新增隧道.
+
+        参数见 NPS Web API 文档 /index/add/：
+        client_id, type, remark, port, server_ip, target,
+        local_proxy, password, local_path, strip_pre, proto_version
+        """
+        _LOGGER.info("新增隧道: %s", params)
+        return self._post(ROUTES["tunnel_add"], **params)
+
+    def edit_tunnel(self, **params) -> dict:
+        """修改隧道（params 中必须含 id）."""
+        _LOGGER.info("修改隧道: %s", params)
+        return self._post(ROUTES["tunnel_edit"], **params)
+
+    def del_tunnel(self, tunnel_id: int) -> dict:
+        """删除隧道."""
+        _LOGGER.info("删除隧道 [ID=%d]", tunnel_id)
+        return self._post(ROUTES["tunnel_del"], id=tunnel_id)
+
+    def copy_tunnel(self, tunnel_id: int) -> dict:
+        """复制隧道（服务端自动分配新端口和 ID）."""
+        _LOGGER.info("复制隧道 [ID=%d]", tunnel_id)
+        return self._post(ROUTES["tunnel_copy"], id=tunnel_id)
+
+    # ------------------------------------------------------------------
+    # 域名映射（Host）的增删改查
+    # ------------------------------------------------------------------
+
+    def add_host(self, **params) -> dict:
+        """新增域名映射."""
+        _LOGGER.info("新增域名映射: %s", params)
+        return self._post(ROUTES["host_add"], **params)
+
+    def edit_host(self, **params) -> dict:
+        """修改域名映射（params 中必须含 id）."""
+        _LOGGER.info("修改域名映射: %s", params)
+        return self._post(ROUTES["host_edit"], **params)
+
+    def del_host(self, host_id: int) -> dict:
+        """删除域名映射."""
+        _LOGGER.info("删除域名映射 [ID=%d]", host_id)
+        return self._post(ROUTES["host_del"], id=host_id)
+
+    def start_host(self, host_id: int) -> dict:
+        """启用域名映射."""
+        return self._post(ROUTES["host_start"], id=host_id)
+
+    def stop_host(self, host_id: int) -> dict:
+        """停用域名映射."""
+        return self._post(ROUTES["host_stop"], id=host_id)
+
+    # ------------------------------------------------------------------
+    # 客户端（NPC）的增删改
+    # ------------------------------------------------------------------
+
+    def add_client(self, **params) -> dict:
+        """新增客户端."""
+        _LOGGER.info("新增客户端: %s", params)
+        return self._post(ROUTES["client_add"], **params)
+
+    def edit_client(self, **params) -> dict:
+        """修改客户端（params 中必须含 id）."""
+        _LOGGER.info("修改客户端: %s", params)
+        return self._post(ROUTES["client_edit"], **params)
+
+    def del_client(self, client_id: int) -> dict:
+        """删除客户端."""
+        _LOGGER.info("删除客户端 [ID=%d]", client_id)
+        return self._post(ROUTES["client_del"], id=client_id)
 
     def test_connection(self) -> bool:
         """测试 API 连接和鉴权是否正常.
