@@ -295,5 +295,5 @@
   window.__npsFloatOpen = openFloat;
   window.__npsFloatClose = closeFloat;
   // 加载标记：F12 Console 输入 __npsFloatEmbed 可确认模块是否生效
-  window.__npsFloatEmbed = "1.0.0";
+  window.__npsFloatEmbed = "1.1.0";
 })();

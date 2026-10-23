@@ -4,6 +4,7 @@ import logging
 
 from homeassistant.components.switch import SwitchEntity
 from homeassistant.core import callback
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.exceptions import HomeAssistantError
 
@@ -408,6 +409,13 @@ class NpsClientSwitch(SwitchEntity):
                     self._bridge_type = c.get("bridgeType") or ""
                     self._bridge_port = c.get("bridgePort") or 0
                     self._server_ip_raw = c.get("ip") or c.get("Ip") or ""
+                    # 动态更新名称（备注 / 验证密钥被修改时跟着变）
+                    remark = c.get("Remark") or ""
+                    vkey = c.get("VerifyKey", "")
+                    if remark:
+                        self._attr_name = f"{self._client_id}_{remark}_{vkey}"
+                    else:
+                        self._attr_name = f"{self._client_id}_NPC_{vkey or 'unknown'}"
                     break
         self.async_write_ha_state()
 
@@ -510,9 +518,11 @@ class NpsPanelAccessSwitch(SwitchEntity):
 
 
 async def async_setup_entry(hass, config_entry, async_add_entities):
-    """为所有隧道和客户端创建 SwitchEntity.
+    """为所有隧道和客户端创建 SwitchEntity，并在增删后动态同步实体集合.
 
     在 async_setup_entry 中被 HA 的 Switch 平台自动调用。
+    面板里新增/删除隧道或客户端后，coordinator 刷新会触发 ``_sync_entities``，
+    这里直接补建缺失的实体、移除已不存在的实体，无需重载集成。
     """
     entry_id = config_entry.entry_id
     data = hass.data[DOMAIN][entry_id]
@@ -520,34 +530,142 @@ async def async_setup_entry(hass, config_entry, async_add_entities):
     api_client = data["api_client"]
     host = config_entry.data["host"]
 
-    entities = []
+    tunnel_switches: dict[int, NpsTunnelSwitch] = {}
+    client_switches: dict[int, NpsClientSwitch] = {}
 
-    # --- 创建隧道开关 ---
-    if coordinator.data:
-        for tunnel_info in coordinator.data:
-            entities.append(
-                NpsTunnelSwitch(coordinator, api_client, entry_id, host, tunnel_info)
-            )
-
-    # --- 创建客户端开关 ---
-    clients = getattr(coordinator, "clients_data", [])
-    if isinstance(clients, list):
-        for c in clients:
-            if c.get("NoDisplay"):
-                continue
-            entities.append(NpsClientSwitch(coordinator, api_client, entry_id, host, c))
-
-    # --- 管理面板访问开关 ---
-    entities.append(NpsPanelAccessSwitch(coordinator, entry_id, host))
-
-    _LOGGER.info("共创建 %d 个开关实体 (%d 隧道 + %d 客户端 + 1 面板访问)",
-                 len(entities),
-                 len([e for e in entities if isinstance(e, NpsTunnelSwitch)]),
-                 len([e for e in entities if isinstance(e, NpsClientSwitch)]))
-
-    async_add_entities(entities)
-
-    for entity in entities:
+    def _make_tunnel(tunnel_info: dict) -> NpsTunnelSwitch | None:
+        """创建隧道开关并挂上 coordinator 监听."""
+        tunnel_id = tunnel_info.get("Id")
+        if tunnel_id is None:
+            return None
+        entity = NpsTunnelSwitch(coordinator, api_client, entry_id, host, tunnel_info)
         entity.async_on_remove(
             coordinator.async_add_listener(entity._handle_coordinator_update)
         )
+        tunnel_switches[tunnel_id] = entity
+        return entity
+
+    def _make_client(client_info: dict) -> NpsClientSwitch:
+        """创建客户端开关并挂上 coordinator 监听."""
+        entity = NpsClientSwitch(coordinator, api_client, entry_id, host, client_info)
+        entity.async_on_remove(
+            coordinator.async_add_listener(entity._handle_coordinator_update)
+        )
+        client_switches[client_info.get("Id")] = entity
+        return entity
+
+    # --- 首次创建：隧道 + 客户端 + 管理面板访问 ---
+    initial: list = []
+    for tunnel_info in coordinator.data or []:
+        entity = _make_tunnel(tunnel_info)
+        if entity is not None:
+            initial.append(entity)
+
+    clients = getattr(coordinator, "clients_data", [])
+    if isinstance(clients, list):
+        for client_info in clients:
+            if client_info.get("NoDisplay"):
+                continue
+            initial.append(_make_client(client_info))
+
+    panel_switch = NpsPanelAccessSwitch(coordinator, entry_id, host)
+    panel_switch.async_on_remove(
+        coordinator.async_add_listener(panel_switch._handle_coordinator_update)
+    )
+    initial.append(panel_switch)
+
+    _LOGGER.info(
+        "共创建 %d 个开关实体 (%d 隧道 + %d 客户端 + 1 面板访问)",
+        len(initial),
+        len(tunnel_switches),
+        len(client_switches),
+    )
+    async_add_entities(initial)
+
+    @callback
+    def _sync_entities() -> None:
+        """对齐实体集合与最新数据：补建新增的、移除已删除的."""
+        new_entities: list = []
+        stale_entities: list = []
+
+        tunnel_ids: set = set()
+        for tunnel_info in coordinator.data or []:
+            tunnel_id = tunnel_info.get("Id")
+            if tunnel_id is None:
+                continue
+            tunnel_ids.add(tunnel_id)
+            if tunnel_id not in tunnel_switches:
+                entity = _make_tunnel(tunnel_info)
+                if entity is not None:
+                    new_entities.append(entity)
+        for tunnel_id in list(tunnel_switches):
+            if tunnel_id not in tunnel_ids:
+                stale_entities.append(tunnel_switches.pop(tunnel_id))
+
+        client_ids: set = set()
+        current_clients = getattr(coordinator, "clients_data", [])
+        if isinstance(current_clients, list):
+            for client_info in current_clients:
+                if client_info.get("NoDisplay"):
+                    continue
+                client_id = client_info.get("Id")
+                if client_id is None:
+                    continue
+                client_ids.add(client_id)
+                if client_id not in client_switches:
+                    new_entities.append(_make_client(client_info))
+        for client_id in list(client_switches):
+            if client_id not in client_ids:
+                stale_entities.append(client_switches.pop(client_id))
+
+        if new_entities:
+            _LOGGER.info("NPS 新增 %d 个实体（隧道/客户端）", len(new_entities))
+            async_add_entities(new_entities)
+        if stale_entities:
+            hass.async_create_task(_async_remove_entities(stale_entities))
+
+        alive = {
+            entity.entity_id
+            for entity in (*tunnel_switches.values(), *client_switches.values())
+        }
+        # 只有全部实体都已真正加入平台时才做残留清理，避免误删刚创建的实体
+        if None not in alive:
+            _purge_orphan_entities(alive)
+
+    async def _async_remove_entities(entities: list) -> None:
+        """彻底移除实体：状态机 + 实体注册表（否则会残留成「不可用/还原」实体）."""
+        registry = er.async_get(hass)
+        for entity in entities:
+            entity_id = entity.entity_id
+            _LOGGER.info("NPS 移除实体: %s（隧道/客户端已删除）", entity_id or entity.name)
+            try:
+                await entity.async_remove(force_remove=True)
+            except Exception as err:  # noqa: BLE001 - 单个实体失败不影响其它
+                _LOGGER.warning("NPS 移除实体失败 %s: %s", entity_id, err)
+            if not entity_id:
+                continue
+            # 兜底：强制清掉注册表条目，避免 HA 重启后把它恢复成「还原实体」
+            if hass.states.get(entity_id) is not None:
+                hass.states.async_remove(entity_id)
+            if registry.async_get(entity_id) is not None:
+                registry.async_remove(entity_id)
+
+    @callback
+    def _purge_orphan_entities(alive: set[str | None]) -> None:
+        """清理已删除隧道/客户端留下的孤儿实体（含以前版本残留的「不可用」实体）."""
+        registry = er.async_get(hass)
+        prefixes = (f"{entry_id}_nps_tunnel_", f"{entry_id}_nps_client_")
+        for registry_entry in er.async_entries_for_config_entry(registry, entry_id):
+            if registry_entry.domain != "switch":
+                continue
+            # unique_id 前缀只有本集成会生成，比 platform 字段更可靠（还原实体可能没有 platform）
+            if not (registry_entry.unique_id or "").startswith(prefixes):
+                continue
+            if registry_entry.entity_id in alive:
+                continue
+            _LOGGER.info("NPS 清理残留实体: %s", registry_entry.entity_id)
+            if hass.states.get(registry_entry.entity_id) is not None:
+                hass.states.async_remove(registry_entry.entity_id)
+            registry.async_remove(registry_entry.entity_id)
+
+    config_entry.async_on_unload(coordinator.async_add_listener(_sync_entities))
