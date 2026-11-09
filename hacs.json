@@ -1,0 +1,6 @@
+{
+  "name": "NPS 隧道管理",
+  "homeassistant": "2024.11.0",
+  "render_readme": true,
+  "zip_release": false
+}
